@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use std::path::Path;
+use crate::logging::{log_debug, log_info, log_warning};
 
 /// Аудио данные
 #[derive(Debug, Clone)]
@@ -241,6 +242,7 @@ impl AudioTrack {
     /// Объединяет все сегменты в один аудио файл
     pub fn merge(&self) -> Result<AudioData> {
         if self.is_empty() {
+            log_warning("Попытка объединить пустой аудио трек");
             return Ok(AudioData::new(Vec::new(), self.sample_rate, self.channels));
         }
 
@@ -256,21 +258,46 @@ impl AudioTrack {
         let total_duration = max_end - min_start;
         let total_samples = (total_duration * self.sample_rate as f64 * self.channels as f64) as usize;
         
+        log_debug(&format!("Объединение {} аудио сегментов, общая длительность: {:.2}с, всего сэмплов: {}", 
+            self.segments.len(), total_duration, total_samples));
+        
+        if total_samples == 0 {
+            log_warning("Объединение привело к нулевому количеству сэмплов");
+            return Ok(AudioData::new(Vec::new(), self.sample_rate, self.channels));
+        }
+        
         let mut merged_samples = vec![0.0; total_samples];
         
         // Объединяем сегменты
-        for segment in &self.segments {
+        for (i, segment) in self.segments.iter().enumerate() {
             let start_sample = ((segment.start_time - min_start) * self.sample_rate as f64 * self.channels as f64) as usize;
+            let num_samples = segment.audio.samples.len();
             
-            for (i, &sample) in segment.audio.samples.iter().enumerate() {
-                let pos = start_sample + i;
+            log_debug(&format!("Сегмент {}/{}: старт: {:.2}с, длительность: {:.2}с, сэмплов: {}", 
+                i + 1, self.segments.len(), segment.start_time, segment.audio.duration(), num_samples));
+            
+            if num_samples == 0 {
+                log_warning(&format!("Сегмент {}/{} не содержит сэмплов", i + 1, self.segments.len()));
+                continue;
+            }
+            
+            for (j, &sample) in segment.audio.samples.iter().enumerate() {
+                let pos = start_sample + j;
                 if pos < merged_samples.len() {
                     merged_samples[pos] = sample;
+                } else {
+                    log_warning(&format!("Выход за пределы буфера при объединении сегмента {}/{}: позиция {} >= {}", 
+                        i + 1, self.segments.len(), pos, merged_samples.len()));
+                    break;
                 }
             }
         }
         
-        Ok(AudioData::new(merged_samples, self.sample_rate, self.channels))
+        let result = AudioData::new(merged_samples, self.sample_rate, self.channels);
+        log_info(&format!("Успешно объединено {} сегментов в один аудио файл длительностью {:.2}с", 
+            self.segments.len(), result.duration()));
+        
+        Ok(result)
     }
 }
 

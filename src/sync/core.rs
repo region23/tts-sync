@@ -7,8 +7,10 @@ use crate::audio::{
     TempoAlgorithm
 };
 use crate::progress::ProgressTracker;
+use crate::logging::{log_debug, log_info, log_error};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use std::collections::HashMap;
 
 /// Ядро синхронизации аудио
 pub struct SyncCore {
@@ -128,6 +130,11 @@ impl SyncCore {
         let progress_step = 40.0f32 / subtitles.len() as f32;
         let mut current_progress = 10.0f32;
         
+        // Создаем кэш для хранения уже сгенерированных TTS сегментов
+        let mut segments_cache: HashMap<String, TtsSegment> = HashMap::new();
+        
+        log_info(&format!("Начало генерации {} TTS сегментов", subtitles.len()));
+        
         for (i, subtitle) in subtitles.iter().enumerate() {
             // Обновляем прогресс
             self.progress_tracker.update(
@@ -135,12 +142,32 @@ impl SyncCore {
                 &format!("Генерация TTS {}/{}", i + 1, subtitles.len())
             )?;
             
-            // Генерируем TTS для субтитра
-            let segment = tts_provider.generate_segment(&subtitle.text, subtitle.duration()).await?;
-            tts_segments.push(segment);
+            log_debug(&format!("Обработка сегмента {}/{}: '{}' (длительность: {:.2}с)",
+                i + 1, subtitles.len(), subtitle.text, subtitle.duration()));
             
+            // Проверяем, есть ли сегмент в кэше
+            let segment = if let Some(cached_segment) = segments_cache.get(&subtitle.text) {
+                log_debug(&format!("Использован кэшированный TTS для сегмента {}/{}", i + 1, subtitles.len()));
+                cached_segment.clone()
+            } else {
+                // Если нет в кэше, генерируем новый
+                log_debug(&format!("Генерация нового TTS для сегмента {}/{}", i + 1, subtitles.len()));
+                let start = std::time::Instant::now();
+                let segment = tts_provider.generate_segment(&subtitle.text, subtitle.duration()).await?;
+                let duration = start.elapsed();
+                log_debug(&format!("TTS сегмент {}/{} сгенерирован за {:.2?}", i + 1, subtitles.len(), duration));
+                
+                // Добавляем в кэш
+                segments_cache.insert(subtitle.text.clone(), segment.clone());
+                segment
+            };
+            
+            tts_segments.push(segment);
             current_progress += progress_step;
         }
+        
+        log_info(&format!("Сгенерировано {} TTS сегментов, из них уникальных: {}", 
+            tts_segments.len(), segments_cache.len()));
         
         Ok(tts_segments)
     }
@@ -340,7 +367,19 @@ impl SyncCore {
     /// Сохраняет аудио трек в файл
     pub async fn save_to_file(&self, audio_track: &AudioTrack, path: &str) -> Result<()> {
         // Объединяем все сегменты
-        let _merged_audio = audio_track.merge()?;
+        let merged_audio = audio_track.merge()?;
+        
+        let num_segments = audio_track.segments.len();
+        let total_samples = merged_audio.samples.len();
+        log_debug(&format!("Сохранение аудио файла: {} сегментов, {} сэмплов", num_segments, total_samples));
+        
+        if num_segments == 0 || total_samples == 0 {
+            log_error::<(), _>(
+                &Error::new(ErrorType::AudioProcessingError, "Аудио трек пуст или не содержит сэмплов"),
+                "Ошибка при сохранении аудио"
+            )?;
+            return Err(Error::new(ErrorType::AudioProcessingError, "Аудио трек пуст или не содержит сэмплов"));
+        }
         
         // Создаем файл
         let mut file = File::create(path).await.map_err(|e| Error::new(
@@ -348,16 +387,138 @@ impl SyncCore {
             &format!("Не удалось создать файл: {}", e)
         ))?;
         
-        // Записываем заголовок WAV (упрощенно)
-        // В реальной реализации здесь будет использоваться библиотека для работы с аудио форматами
-        file.write_all(&[0u8; 44]).await.map_err(|e| Error::new(
+        // Определяем формат по расширению файла
+        let ext = path.split('.').last().unwrap_or("mp3").to_lowercase();
+        
+        match ext.as_str() {
+            "mp3" => {
+                // Для MP3 используем конвертацию через временный WAV файл и внешнюю библиотеку
+                let temp_wav_path = format!("{}.temp.wav", path);
+                self.write_wav_file(&merged_audio, &temp_wav_path).await?;
+                
+                // Конвертируем WAV в MP3 (в реальной реализации)
+                // Здесь временно просто копируем данные WAV в MP3 файл
+                let wav_data = tokio::fs::read(&temp_wav_path).await.map_err(|e| Error::new(
+                    ErrorType::Io,
+                    &format!("Не удалось прочитать временный WAV файл: {}", e)
+                ))?;
+                
+                file.write_all(&wav_data).await.map_err(|e| Error::new(
+                    ErrorType::Io,
+                    &format!("Не удалось записать MP3 файл: {}", e)
+                ))?;
+                
+                // Удаляем временный файл
+                let _ = tokio::fs::remove_file(&temp_wav_path).await;
+                
+                log_debug(&format!("Записано {} байт в MP3 файл {}", wav_data.len(), path));
+            },
+            "wav" => {
+                // Записываем WAV файл напрямую
+                self.write_wav_file(&merged_audio, path).await?;
+            },
+            "ogg" => {
+                // Аналогично MP3, но для OGG
+                // В реальной реализации здесь будет конвертация в OGG
+                let temp_wav_path = format!("{}.temp.wav", path);
+                self.write_wav_file(&merged_audio, &temp_wav_path).await?;
+                
+                // Конвертируем WAV в OGG (в реальной реализации)
+                // Здесь временно просто копируем данные WAV в OGG файл
+                let wav_data = tokio::fs::read(&temp_wav_path).await.map_err(|e| Error::new(
+                    ErrorType::Io,
+                    &format!("Не удалось прочитать временный WAV файл: {}", e)
+                ))?;
+                
+                file.write_all(&wav_data).await.map_err(|e| Error::new(
+                    ErrorType::Io,
+                    &format!("Не удалось записать OGG файл: {}", e)
+                ))?;
+                
+                // Удаляем временный файл
+                let _ = tokio::fs::remove_file(&temp_wav_path).await;
+                
+                log_debug(&format!("Записано {} байт в OGG файл {}", wav_data.len(), path));
+            },
+            _ => {
+                return Err(Error::new(
+                    ErrorType::AudioProcessingError,
+                    &format!("Неподдерживаемый формат аудио: {}", ext)
+                ));
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Записывает данные аудио в формате WAV
+    async fn write_wav_file(&self, audio_data: &AudioData, path: &str) -> Result<()> {
+        let mut file = File::create(path).await.map_err(|e| Error::new(
+            ErrorType::Io,
+            &format!("Не удалось создать WAV файл: {}", e)
+        ))?;
+        
+        let total_samples = audio_data.samples.len();
+        let num_channels = audio_data.channels;
+        let sample_rate = audio_data.sample_rate;
+        
+        // Создаем заголовок WAV
+        let data_size = (total_samples * 2) as u32; // 16-bit PCM, 2 байта на сэмпл
+        let file_size = data_size + 36; // 44 байта заголовка - 8 байтов
+        
+        let mut header = vec![
+            // RIFF chunk
+            b'R', b'I', b'F', b'F',
+            (file_size & 0xFF) as u8, ((file_size >> 8) & 0xFF) as u8, ((file_size >> 16) & 0xFF) as u8, ((file_size >> 24) & 0xFF) as u8,
+            b'W', b'A', b'V', b'E',
+            
+            // fmt subchunk
+            b'f', b'm', b't', b' ',
+            16, 0, 0, 0, // размер подчанка fmt (16 байтов)
+            1, 0, // аудио формат (1 = PCM)
+            (num_channels & 0xFF) as u8, ((num_channels >> 8) & 0xFF) as u8, // количество каналов
+            (sample_rate & 0xFF) as u8, ((sample_rate >> 8) & 0xFF) as u8, ((sample_rate >> 16) & 0xFF) as u8, ((sample_rate >> 24) & 0xFF) as u8, // частота дискретизации
+        ];
+        
+        // Вычисляем и добавляем байт рейт и блок выравнивания
+        let byte_rate = sample_rate * num_channels as u32 * 16 / 8;
+        let block_align = num_channels as u16 * 16 / 8;
+        
+        header.extend_from_slice(&[
+            // байт рейт = SampleRate * NumChannels * BitsPerSample / 8
+            (byte_rate & 0xFF) as u8, ((byte_rate >> 8) & 0xFF) as u8, ((byte_rate >> 16) & 0xFF) as u8, ((byte_rate >> 24) & 0xFF) as u8,
+            
+            // блок выравнивания = NumChannels * BitsPerSample / 8
+            (block_align & 0xFF) as u8, ((block_align >> 8) & 0xFF) as u8,
+            
+            16, 0, // биты на сэмпл
+            
+            // data subchunk
+            b'd', b'a', b't', b'a',
+            (data_size & 0xFF) as u8, ((data_size >> 8) & 0xFF) as u8, ((data_size >> 16) & 0xFF) as u8, ((data_size >> 24) & 0xFF) as u8,
+        ]);
+        
+        // Записываем заголовок
+        file.write_all(&header).await.map_err(|e| Error::new(
             ErrorType::Io,
             &format!("Не удалось записать заголовок WAV: {}", e)
         ))?;
         
-        // Записываем аудио данные
-        // В реальной реализации здесь будет конвертация float в int16/int24
-        // и запись в соответствующем формате
+        // Конвертируем float сэмплы в 16-bit PCM и записываем их
+        let mut pcm_data = Vec::with_capacity(total_samples * 2);
+        for &sample in &audio_data.samples {
+            // Преобразуем float в int16
+            let pcm_sample = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
+            pcm_data.push((pcm_sample & 0xFF) as u8);
+            pcm_data.push(((pcm_sample >> 8) & 0xFF) as u8);
+        }
+        
+        file.write_all(&pcm_data).await.map_err(|e| Error::new(
+            ErrorType::Io,
+            &format!("Не удалось записать аудио данные: {}", e)
+        ))?;
+        
+        log_debug(&format!("Записано {} байт в WAV файл {}", header.len() + pcm_data.len(), path));
         
         Ok(())
     }
