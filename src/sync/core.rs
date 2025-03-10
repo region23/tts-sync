@@ -7,10 +7,11 @@ use crate::audio::{
     TempoAlgorithm
 };
 use crate::progress::ProgressTracker;
-use crate::logging::{log_debug, log_info, log_error};
+use crate::logging::{log_debug, log_info, log_error, log_warning};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use std::collections::HashMap;
+use std::process::Command;
 
 /// Ядро синхронизации аудио
 pub struct SyncCore {
@@ -381,64 +382,91 @@ impl SyncCore {
             return Err(Error::new(ErrorType::AudioProcessingError, "Аудио трек пуст или не содержит сэмплов"));
         }
         
-        // Создаем файл
-        let mut file = File::create(path).await.map_err(|e| Error::new(
-            ErrorType::Io,
-            &format!("Не удалось создать файл: {}", e)
-        ))?;
-        
         // Определяем формат по расширению файла
         let ext = path.split('.').last().unwrap_or("mp3").to_lowercase();
         
+        // Всегда сначала сохраняем в WAV, так как с ним проще работать
+        let temp_wav_path = format!("{}.temp.wav", path);
+        self.write_wav_file(&merged_audio, &temp_wav_path).await?;
+        
         match ext.as_str() {
             "mp3" => {
-                // Для MP3 используем конвертацию через временный WAV файл и внешнюю библиотеку
-                let temp_wav_path = format!("{}.temp.wav", path);
-                self.write_wav_file(&merged_audio, &temp_wav_path).await?;
+                // Используем ffmpeg если доступен для конвертации WAV в MP3
+                log_debug("Конвертация WAV в MP3 с помощью ffmpeg");
                 
-                // Конвертируем WAV в MP3 (в реальной реализации)
-                // Здесь временно просто копируем данные WAV в MP3 файл
-                let wav_data = tokio::fs::read(&temp_wav_path).await.map_err(|e| Error::new(
-                    ErrorType::Io,
-                    &format!("Не удалось прочитать временный WAV файл: {}", e)
-                ))?;
+                let result = Command::new("ffmpeg")
+                    .arg("-y") // Перезаписать выходной файл без вопросов
+                    .arg("-i")
+                    .arg(&temp_wav_path)
+                    .arg("-codec:a")
+                    .arg("libmp3lame")
+                    .arg("-qscale:a")
+                    .arg("2") // Высокое качество (0-9, где 0 - лучшее)
+                    .arg(path)
+                    .output();
                 
-                file.write_all(&wav_data).await.map_err(|e| Error::new(
-                    ErrorType::Io,
-                    &format!("Не удалось записать MP3 файл: {}", e)
-                ))?;
-                
-                // Удаляем временный файл
-                let _ = tokio::fs::remove_file(&temp_wav_path).await;
-                
-                log_debug(&format!("Записано {} байт в MP3 файл {}", wav_data.len(), path));
+                match result {
+                    Ok(output) => {
+                        if !output.status.success() {
+                            // Если ffmpeg не удался, используем fallback метод
+                            log_warning("ffmpeg не удалось выполнить конвертацию, использую альтернативный метод");
+                            self.fallback_mp3_conversion(&temp_wav_path, path).await?;
+                        } else {
+                            log_debug(&format!("Успешно сконвертировано в MP3 с помощью ffmpeg: {}", path));
+                        }
+                    },
+                    Err(e) => {
+                        // Если ffmpeg не найден или не работает, используем fallback метод
+                        log_warning(&format!("ffmpeg не найден или не работает ({}), использую альтернативный метод", e));
+                        self.fallback_mp3_conversion(&temp_wav_path, path).await?;
+                    }
+                }
             },
             "wav" => {
-                // Записываем WAV файл напрямую
-                self.write_wav_file(&merged_audio, path).await?;
+                // WAV уже готов, просто переименовываем или копируем файл
+                if temp_wav_path != path {
+                    tokio::fs::copy(&temp_wav_path, path).await.map_err(|e| Error::new(
+                        ErrorType::Io,
+                        &format!("Не удалось скопировать WAV файл: {}", e)
+                    ))?;
+                }
+                log_debug(&format!("Сохранен WAV файл: {}", path));
             },
             "ogg" => {
-                // Аналогично MP3, но для OGG
-                // В реальной реализации здесь будет конвертация в OGG
-                let temp_wav_path = format!("{}.temp.wav", path);
-                self.write_wav_file(&merged_audio, &temp_wav_path).await?;
+                // Используем ffmpeg если доступен для конвертации WAV в OGG
+                log_debug("Конвертация WAV в OGG с помощью ffmpeg");
                 
-                // Конвертируем WAV в OGG (в реальной реализации)
-                // Здесь временно просто копируем данные WAV в OGG файл
-                let wav_data = tokio::fs::read(&temp_wav_path).await.map_err(|e| Error::new(
-                    ErrorType::Io,
-                    &format!("Не удалось прочитать временный WAV файл: {}", e)
-                ))?;
+                let result = Command::new("ffmpeg")
+                    .arg("-y")
+                    .arg("-i")
+                    .arg(&temp_wav_path)
+                    .arg("-codec:a")
+                    .arg("libvorbis")
+                    .arg("-q:a")
+                    .arg("4") // Качество (0-10, где 10 - лучшее)
+                    .arg(path)
+                    .output();
                 
-                file.write_all(&wav_data).await.map_err(|e| Error::new(
-                    ErrorType::Io,
-                    &format!("Не удалось записать OGG файл: {}", e)
-                ))?;
-                
-                // Удаляем временный файл
-                let _ = tokio::fs::remove_file(&temp_wav_path).await;
-                
-                log_debug(&format!("Записано {} байт в OGG файл {}", wav_data.len(), path));
+                match result {
+                    Ok(output) => {
+                        if !output.status.success() {
+                            log_warning("ffmpeg не удалось выполнить конвертацию в OGG, сохраняю как WAV");
+                            tokio::fs::copy(&temp_wav_path, path).await.map_err(|e| Error::new(
+                                ErrorType::Io,
+                                &format!("Не удалось скопировать WAV файл: {}", e)
+                            ))?;
+                        } else {
+                            log_debug(&format!("Успешно сконвертировано в OGG с помощью ffmpeg: {}", path));
+                        }
+                    },
+                    Err(e) => {
+                        log_warning(&format!("ffmpeg не найден или не работает ({}), сохраняю как WAV", e));
+                        tokio::fs::copy(&temp_wav_path, path).await.map_err(|e| Error::new(
+                            ErrorType::Io,
+                            &format!("Не удалось скопировать WAV файл: {}", e)
+                        ))?;
+                    }
+                }
             },
             _ => {
                 return Err(Error::new(
@@ -448,9 +476,75 @@ impl SyncCore {
             }
         }
         
+        // Удаляем временный WAV файл
+        let _ = tokio::fs::remove_file(&temp_wav_path).await;
+        
         Ok(())
     }
     
+    /// Запасной метод для конвертации в MP3, если ffmpeg недоступен
+    async fn fallback_mp3_conversion(&self, wav_path: &str, mp3_path: &str) -> Result<()> {
+        // В реальном приложении здесь можно использовать встроенную библиотеку для кодирования MP3
+        // Например, lame-rs, minimp3, etc.
+        // В этом примере просто копируем WAV в MP3 и добавляем предупреждение
+        log_warning("Используется резервный метод конвертации WAV в MP3 - файл может быть несовместим с плеерами");
+        log_warning("Рекомендуется установить ffmpeg для правильной конвертации");
+        
+        // Создаем простой заголовок MP3 (это НЕ правильный MP3, но лучше чем ничего)
+        let mut mp3_file = File::create(mp3_path).await.map_err(|e| Error::new(
+            ErrorType::Io,
+            &format!("Не удалось создать MP3 файл: {}", e)
+        ))?;
+        
+        // Вместо копирования всего WAV как раньше, попробуем извлечь только PCM данные (пропуская WAV заголовок)
+        let wav_data = tokio::fs::read(wav_path).await.map_err(|e| Error::new(
+            ErrorType::Io,
+            &format!("Не удалось прочитать WAV файл: {}", e)
+        ))?;
+        
+        // Пропускаем WAV заголовок (44 байта) и записываем только данные
+        if wav_data.len() > 44 {
+            let pcm_data = &wav_data[44..];
+            
+            // Создаем простейший "необработанный" MP3 заголовок (не настоящий MP3)
+            let mut mp3_header = vec![
+                // ID3v2 заголовок
+                b'I', b'D', b'3', // Идентификатор
+                0x03, 0x00,       // Версия
+                0x00,             // Флаги
+                0x00, 0x00, 0x00, 0x0A, // Размер (10 байт)
+                
+                // Простой фрейм (текстовый)
+                b'T', b'I', b'T', b'2', // Идентификатор фрейма (название)
+                0x00, 0x00, 0x00, 0x01, // Размер (1 байт)
+                0x00, 0x00,       // Флаги
+                0x00              // Пустое значение
+            ];
+            
+            // Записываем заголовок
+            mp3_file.write_all(&mp3_header).await.map_err(|e| Error::new(
+                ErrorType::Io,
+                &format!("Не удалось записать MP3 заголовок: {}", e)
+            ))?;
+            
+            // Записываем PCM данные (это не настоящий MP3, но может помочь отладить проблему)
+            mp3_file.write_all(pcm_data).await.map_err(|e| Error::new(
+                ErrorType::Io,
+                &format!("Не удалось записать аудио данные: {}", e)
+            ))?;
+            
+            log_debug(&format!("Записано {} байт в MP3 файл {} (резервный метод)", 
+                mp3_header.len() + pcm_data.len(), mp3_path));
+        } else {
+            log_error::<(), _>(
+                &Error::new(ErrorType::AudioProcessingError, "WAV файл слишком мал или повреждён"),
+                "Ошибка при конвертации WAV в MP3"
+            )?;
+        }
+        
+        Ok(())
+    }
+
     /// Записывает данные аудио в формате WAV
     async fn write_wav_file(&self, audio_data: &AudioData, path: &str) -> Result<()> {
         let mut file = File::create(path).await.map_err(|e| Error::new(
@@ -507,8 +601,10 @@ impl SyncCore {
         // Конвертируем float сэмплы в 16-bit PCM и записываем их
         let mut pcm_data = Vec::with_capacity(total_samples * 2);
         for &sample in &audio_data.samples {
-            // Преобразуем float в int16
+            // Преобразуем float в int16, важно нормализовать значения правильно
             let pcm_sample = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
+            
+            // Записываем в порядке little-endian (младший байт, затем старший)
             pcm_data.push((pcm_sample & 0xFF) as u8);
             pcm_data.push(((pcm_sample >> 8) & 0xFF) as u8);
         }
