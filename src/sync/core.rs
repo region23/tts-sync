@@ -241,28 +241,54 @@ impl SyncCore {
             // Сохраняем исходные MP3 данные для последующего прямого сохранения
             let raw_audio_data = segment.audio_data.clone();
             
-            // Конвертируем бинарные аудио данные в float сэмплы
-            // Это упрощенная реализация, в реальности нужно декодировать MP3/другой формат
-            // Здесь мы просто создаем пустые сэмплы для демонстрации
-            let samples = vec![0.0f32; (self.sample_rate as f64 * subtitle.duration()) as usize];
+            // Декодируем MP3 данные в сэмплы с использованием Symphonia
+            log_debug(&format!("Декодирование сегмента {}/{} размером {} байт", 
+                i + 1, tts_segments.len(), raw_audio_data.len()));
             
-            // Создаем аудио данные
-            let audio_data = AudioData::new(
-                samples,
-                self.sample_rate,
-                self.channels,
-            );
+            let audio_data = match crate::audio::utils::decode_mp3_to_samples(
+                &raw_audio_data, 
+                self.sample_rate, 
+                self.channels
+            ) {
+                Ok(data) => {
+                    log_debug(&format!("Успешно декодирован MP3 сегмент {}/{}: {} сэмплов, длительность {:.2}с", 
+                        i + 1, tts_segments.len(), data.samples.len(), data.duration()));
+                    data
+                },
+                Err(err) => {
+                    log_warning(&format!("Ошибка при декодировании MP3 сегмента {}/{}: {}", 
+                        i + 1, tts_segments.len(), err));
+                    
+                    // Создаем заглушку если декодирование не удалось (предотвращаем полную остановку процесса)
+                    log_warning("Создаем пустой сегмент как заглушку");
+                    let empty_samples = vec![0.0f32; (self.sample_rate as f64 * subtitle.duration()) as usize];
+                    AudioData::new(
+                        empty_samples,
+                        self.sample_rate,
+                        self.channels,
+                    )
+                }
+            };
             
             // Анализируем аудио для определения характеристик
-            let _analysis = AudioAnalyzer::analyze(&audio_data)?;
+            let analysis = AudioAnalyzer::analyze(&audio_data)?;
+            log_debug(&format!("Анализ аудио сегмента {}/{}: пик громкости: {:.2}, средняя громкость: {:.2}",
+                i + 1, tts_segments.len(), analysis.peak, analysis.rms));
             
             // Рассчитываем целевую длительность из субтитров
             let target_duration = subtitle.duration() as f32;
             let current_duration = audio_data.duration() as f32;
             
+            log_debug(&format!("Сегмент {}/{}: текущая длительность: {:.2}с, целевая: {:.2}с, разница: {:.2}с",
+                i + 1, tts_segments.len(), current_duration, target_duration, 
+                current_duration - target_duration));
+            
             // Корректируем длительность аудио, если необходимо
             let adjusted_audio = if (current_duration - target_duration).abs() > 0.05 {
                 // Используем адаптивное изменение темпа с сохранением пауз
+                log_debug(&format!("Корректировка длительности сегмента {}/{} с {:.2}с до {:.2}с", 
+                    i + 1, tts_segments.len(), current_duration, target_duration));
+                
                 TempoAdjuster::adaptive_tempo_adjustment(
                     &audio_data,
                     target_duration,
@@ -271,10 +297,13 @@ impl SyncCore {
                 )?
             } else {
                 // Если разница незначительная, оставляем как есть
+                log_debug(&format!("Разница длительности сегмента {}/{} незначительна ({:.2}с), оставляем без изменений", 
+                    i + 1, tts_segments.len(), current_duration - target_duration));
                 audio_data
             };
             
             // Создаем аудио сегмент с сохранением исходных данных
+            let raw_audio_size = raw_audio_data.len();
             let audio_segment = AudioSegment::new_with_raw_data(
                 adjusted_audio,
                 subtitle.start_time,
@@ -284,6 +313,8 @@ impl SyncCore {
             );
             
             adjusted_segments.push(audio_segment);
+            log_debug(&format!("Добавлен сегмент {}/{} с сохранением исходных MP3 данных ({} байт)",
+                i + 1, tts_segments.len(), raw_audio_size));
             
             current_progress += progress_step;
         }
