@@ -184,7 +184,7 @@ impl Default for TtsOptions {
 }
 
 /// Запрос к OpenAI TTS API
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize, Debug)]
 struct TtsRequest {
     model: String,
     input: String,
@@ -235,18 +235,24 @@ impl OpenAiTts {
         log_debug(&format!("OpenAI TTS запрос: '{}' с использованием голоса {} и модели {}", 
             text, self.options.voice.as_str(), self.options.model.as_str()));
         
+        // Создаем структуру запроса в формате JSON (а не multipart/form-data)
+        let request = TtsRequest {
+            model: self.options.model.as_str().to_string(),
+            input: text.to_string(),
+            voice: self.options.voice.as_str().to_string(),
+            response_format: self.options.response_format.as_str().to_string(),
+            speed: self.options.speed,
+        };
+
+        log_debug(&format!("Отправляем запрос к OpenAI TTS API: model={}, voice={}, format={}, speed={}",
+            request.model, request.voice, request.response_format, request.speed));
+        
         let client = reqwest::Client::new();
         
-        let form = reqwest::multipart::Form::new()
-            .text("model", self.options.model.as_str().to_string())
-            .text("voice", self.options.voice.as_str().to_string())
-            .text("response_format", self.options.response_format.as_str().to_string())
-            .text("speed", self.options.speed.to_string())
-            .text("input", text.to_string());
-
         let response = client.post("https://api.openai.com/v1/audio/speech")
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .multipart(form)
+            .header("Content-Type", "application/json")
+            .json(&request) // Используем JSON вместо multipart/form-data
             .send()
             .await
             .map_err(|e| Error::new(
