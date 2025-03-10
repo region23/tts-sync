@@ -231,12 +231,15 @@ impl SyncCore {
         let progress_step = 20.0f32 / tts_segments.len() as f32;
         let mut current_progress = 50.0f32;
         
-        for (i, (_segment, subtitle)) in tts_segments.iter().zip(subtitles.iter()).enumerate() {
+        for (i, (segment, subtitle)) in tts_segments.iter().zip(subtitles.iter()).enumerate() {
             // Обновляем прогресс
             self.progress_tracker.update(
                 current_progress,
                 &format!("Анализ и корректировка сегмента {}/{}", i + 1, tts_segments.len())
             )?;
+            
+            // Сохраняем исходные MP3 данные для последующего прямого сохранения
+            let raw_audio_data = segment.audio_data.clone();
             
             // Конвертируем бинарные аудио данные в float сэмплы
             // Это упрощенная реализация, в реальности нужно декодировать MP3/другой формат
@@ -271,12 +274,13 @@ impl SyncCore {
                 audio_data
             };
             
-            // Создаем аудио сегмент
-            let audio_segment = AudioSegment::new(
+            // Создаем аудио сегмент с сохранением исходных данных
+            let audio_segment = AudioSegment::new_with_raw_data(
                 adjusted_audio,
                 subtitle.start_time,
                 subtitle.end_time,
-                subtitle.text.clone()
+                subtitle.text.clone(),
+                raw_audio_data
             );
             
             adjusted_segments.push(audio_segment);
@@ -436,6 +440,12 @@ impl SyncCore {
             .unwrap_or("mp3")
             .to_lowercase();
         
+        // Проверяем, есть ли у нас исходные MP3 данные, которые можно сохранить напрямую
+        if ext == "mp3" && self.try_direct_mp3_save(audio_track, path).await? {
+            log_info(&format!("Финальный аудио файл создан напрямую: {}, формат: MP3", path));
+            return Ok(());
+        }
+        
         // Всегда сначала сохраняем в WAV, так как с ним проще работать
         let temp_wav_path = format!("{}.temp.wav", path);
         log_debug(&format!("Создание временного WAV файла: {}", temp_wav_path));
@@ -573,7 +583,6 @@ impl SyncCore {
     async fn convert_with_symphonia(&self, input_path: &str, output_path: &str, format: &str) -> Result<()> {
         log_debug(&format!("Использую библиотеку symphonia для конвертации в {}: {} -> {}", format, input_path, output_path));
         
-        // Пока не реализуем кодирование через symphonia, т.к. это требует дополнительных зависимостей
         // Вместо этого используем прямую копию WAV файла с предупреждением
         
         log_warning(&format!("Полная конвертация в {} с помощью библиотеки не реализована", format));
@@ -724,5 +733,65 @@ impl SyncCore {
         }
         
         Ok(())
+    }
+
+    /// Пытается сохранить MP3 файл напрямую из исходных сегментов, если они в MP3 формате
+    async fn try_direct_mp3_save(&self, audio_track: &AudioTrack, path: &str) -> Result<bool> {
+        // Проверяем, есть ли у нас доступ к исходным MP3 данным в сегментах
+        let has_raw_mp3 = audio_track.segments.iter().any(|segment| {
+            // Здесь проверка наличия исходных MP3 данных в сегменте
+            // В текущей реализации мы используем эвристику - проверяем первые байты
+            if let Some(original_data) = self.get_raw_segment_data(segment) {
+                // Проверяем, что это MP3 файл: должен начинаться с ID3 или с MP3 frame sync
+                !original_data.is_empty() && (
+                    (original_data.len() > 3 && &original_data[0..3] == b"ID3") ||
+                    (original_data.len() > 2 && (original_data[0] == 0xFF && (original_data[1] & 0xE0) == 0xE0))
+                )
+            } else {
+                false
+            }
+        });
+
+        if !has_raw_mp3 {
+            log_debug("Не найдены исходные MP3 данные в сегментах, использую стандартный процесс конвертации");
+            return Ok(false);
+        }
+
+        log_debug("Найдены исходные MP3 данные, пробую прямое сохранение");
+
+        // Собираем все MP3 сегменты в один файл
+        let mut output_file = tokio::fs::File::create(path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось создать выходной файл: {}", e)))?;
+
+        // Копируем данные каждого сегмента напрямую в выходной файл
+        for (idx, segment) in audio_track.segments.iter().enumerate() {
+            if let Some(mp3_data) = self.get_raw_segment_data(segment) {
+                log_debug(&format!("Копирование исходного MP3 сегмента {}/{} ({}Kб)", 
+                    idx + 1, audio_track.segments.len(), mp3_data.len() / 1024));
+                
+                output_file.write_all(&mp3_data).await
+                    .map_err(|e| Error::new(ErrorType::Io, &format!("Ошибка записи MP3 данных: {}", e)))?;
+            }
+        }
+
+        // Проверяем размер созданного файла
+        let file_metadata = tokio::fs::metadata(path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось получить метаданные файла: {}", e)))?;
+        
+        if file_metadata.len() == 0 {
+            log_warning("Созданный MP3 файл пуст, возвращаюсь к стандартному методу");
+            tokio::fs::remove_file(path).await.ok(); // Удаляем пустой файл
+            return Ok(false);
+        }
+
+        log_info(&format!("Финальный аудио файл создан напрямую из MP3 сегментов: {}, размер: {} байт", 
+            path, file_metadata.len()));
+        return Ok(true);
+    }
+
+    /// Получает исходные MP3 данные из сегмента (если они доступны)
+    fn get_raw_segment_data(&self, segment: &AudioSegment) -> Option<Vec<u8>> {
+        // Возвращаем клонированный вектор с исходными данными, если они есть
+        segment.raw_data.clone()
     }
 }

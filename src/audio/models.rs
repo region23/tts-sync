@@ -164,6 +164,8 @@ pub struct AudioSegment {
     pub end_time: f64,
     /// Текст сегмента
     pub text: String,
+    /// Исходные бинарные данные аудио (если доступны, например, MP3 от OpenAI)
+    pub raw_data: Option<Vec<u8>>,
 }
 
 impl AudioSegment {
@@ -174,6 +176,18 @@ impl AudioSegment {
             start_time,
             end_time,
             text,
+            raw_data: None,
+        }
+    }
+
+    /// Создает новый сегмент аудио с исходными бинарными данными
+    pub fn new_with_raw_data(audio: AudioData, start_time: f64, end_time: f64, text: String, raw_data: Vec<u8>) -> Self {
+        Self {
+            audio,
+            start_time,
+            end_time,
+            text,
+            raw_data: Some(raw_data),
         }
     }
 
