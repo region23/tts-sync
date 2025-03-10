@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"macro":["interpolator"],"mod":["sinc_interpolator_avx","sinc_interpolator_neon","sinc_interpolator_sse"],"struct":["ScalarInterpolator"],"trait":["SincInterpolator"]};

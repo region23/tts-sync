@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"static":["FEATURES"],"struct":["NeonInterpolator"],"trait":["NeonSample"]};

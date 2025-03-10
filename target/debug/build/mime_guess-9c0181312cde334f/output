@@ -1,1 +1,0 @@
-cargo:rustc-env=MIME_TYPES_GENERATED_PATH=/Users/pavlenko/code/my_projects/rust/tts-sync/tts-sync/target/debug/build/mime_guess-9c0181312cde334f/out/mime_types_generated.rs

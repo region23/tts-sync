@@ -1,1 +1,0 @@
-window.SIDEBAR_ITEMS = {"fn":["validate_sample_rates"],"struct":["FftFixedIn","FftFixedInOut","FftFixedOut","FftResampler"]};
