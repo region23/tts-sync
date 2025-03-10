@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["POLYNOMIAL_LEN_I","POLYNOMIAL_LEN_U"],"enum":["PolynomialDegree"],"fn":["interp_cubic","interp_lin","interp_quintic","interp_septic","validate_ratios"],"macro":["t"],"struct":["FastFixedIn","FastFixedOut"]};

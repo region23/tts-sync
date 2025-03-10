@@ -1,0 +1,1 @@
+Pin<Box<(dyn Future<Output = Result<(), tts_sync::Error>> + Send + 'async_trait)>>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SincInterpolationType"],"fn":["interp_cubic","interp_lin","interp_quad","make_interpolator","validate_ratios"],"struct":["SincFixedIn","SincFixedOut","SincInterpolationParameters"]};

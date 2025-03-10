@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["WindowFunction"],"fn":["blackman","blackman_harris","calculate_cutoff","hann","make_window"]};
