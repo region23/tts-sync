@@ -1,8 +1,9 @@
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, ErrorType};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use crate::logging::{log_debug, log_info, log_error, log_warning, log_trace};
 
 /// Модели голосов OpenAI TTS
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,35 +230,70 @@ impl OpenAiTts {
         Self::new(api_key, TtsOptions::default())
     }
     
-    /// Генерирует TTS для текста
+    /// Генерирует TTS для указанного текста
     pub async fn generate_speech(&self, text: &str) -> Result<Vec<u8>> {
-        let request = TtsRequest {
-            model: self.options.model.as_str().to_string(),
-            input: text.to_string(),
-            voice: self.options.voice.as_str().to_string(),
-            response_format: self.options.response_format.as_str().to_string(),
-            speed: self.options.speed,
-        };
+        log_debug(&format!("OpenAI TTS запрос: '{}' с использованием голоса {} и модели {}", 
+            text, self.options.voice.as_str(), self.options.model.as_str()));
         
-        let response = self.client
-            .post("https://api.openai.com/v1/audio/speech")
+        let client = reqwest::Client::new();
+        
+        let form = reqwest::multipart::Form::new()
+            .text("model", self.options.model.as_str().to_string())
+            .text("voice", self.options.voice.as_str().to_string())
+            .text("response_format", self.options.response_format.as_str().to_string())
+            .text("speed", self.options.speed.to_string())
+            .text("input", text.to_string());
+
+        let response = client.post("https://api.openai.com/v1/audio/speech")
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .json(&request)
+            .multipart(form)
             .send()
             .await
-            .map_err(|e| Error::OpenAi(format!("Failed to send request: {}", e)))?;
+            .map_err(|e| Error::new(
+                ErrorType::OpenAi,
+                &format!("Ошибка при отправке запроса к OpenAI TTS API: {}", e)
+            ))?;
+            
+        let status = response.status();
+        log_debug(&format!("Получен ответ от OpenAI API, статус: {}", status));
         
-        if !response.status().is_success() {
+        if !status.is_success() {
             let error_text = response.text().await
-                .unwrap_or_else(|_| "Failed to get error text".to_string());
-            return Err(Error::OpenAi(format!("API error: {}", error_text)));
+                .unwrap_or_else(|_| "Не удалось получить текст ошибки".to_string());
+            
+            log_error::<(), _>(
+                &Error::new(ErrorType::OpenAi, &error_text),
+                &format!("OpenAI API вернул ошибку: {}", status)
+            )?;
+            
+            return Err(Error::new(
+                ErrorType::OpenAi,
+                &format!("Ошибка OpenAI API: {}. {}", status, error_text)
+            ));
         }
         
         let audio_data = response.bytes().await
-            .map_err(|e| Error::OpenAi(format!("Failed to get response bytes: {}", e)))?
-            .to_vec();
+            .map_err(|e| Error::new(
+                ErrorType::OpenAi,
+                &format!("Ошибка при получении данных от OpenAI TTS API: {}", e)
+            ))?;
+            
+        let bytes = audio_data.to_vec();
+        let size = bytes.len();
         
-        Ok(audio_data)
+        if size < 100 {
+            log_warning(&format!("Получены подозрительно малые данные от OpenAI TTS: {} байт", size));
+            
+            // Для отладки выведем первые несколько байт
+            if !bytes.is_empty() {
+                let debug_bytes = bytes.iter().take(16).map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                log_debug(&format!("Первые 16 байт: {}", debug_bytes));
+            }
+        } else {
+            log_debug(&format!("Получено {} байт аудио данных от OpenAI TTS API", size));
+        }
+        
+        Ok(bytes)
     }
     
     /// Генерирует TTS для текста и сохраняет в файл

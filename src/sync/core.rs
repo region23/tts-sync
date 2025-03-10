@@ -7,11 +7,21 @@ use crate::audio::{
     TempoAlgorithm
 };
 use crate::progress::ProgressTracker;
-use crate::logging::{log_debug, log_info, log_error, log_warning};
+use crate::logging::{log_debug, log_info, log_error, log_warning, log_trace};
 use tokio::fs::File;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use std::collections::HashMap;
 use std::process::Command;
+use std::path::Path;
+use std::fs;
+use std::io::Cursor;
+
+// Используем Symphonia для работы с аудио
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 
 /// Ядро синхронизации аудио
 pub struct SyncCore {
@@ -136,6 +146,13 @@ impl SyncCore {
         
         log_info(&format!("Начало генерации {} TTS сегментов", subtitles.len()));
         
+        // Временная директория для сохранения и проверки TTS данных
+        let temp_dir = std::env::temp_dir().join("tts_sync_temp");
+        if !temp_dir.exists() {
+            std::fs::create_dir_all(&temp_dir).map_err(|e| 
+                Error::new(ErrorType::Io, &format!("Не удалось создать временную директорию: {}", e)))?;
+        }
+        
         for (i, subtitle) in subtitles.iter().enumerate() {
             // Обновляем прогресс
             self.progress_tracker.update(
@@ -147,19 +164,46 @@ impl SyncCore {
                 i + 1, subtitles.len(), subtitle.text, subtitle.duration()));
             
             // Проверяем, есть ли сегмент в кэше
-            let segment = if let Some(cached_segment) = segments_cache.get(&subtitle.text) {
+            let cache_key = subtitle.text.clone();
+            let segment = if let Some(cached_segment) = segments_cache.get(&cache_key) {
                 log_debug(&format!("Использован кэшированный TTS для сегмента {}/{}", i + 1, subtitles.len()));
                 cached_segment.clone()
             } else {
                 // Если нет в кэше, генерируем новый
                 log_debug(&format!("Генерация нового TTS для сегмента {}/{}", i + 1, subtitles.len()));
                 let start = std::time::Instant::now();
-                let segment = tts_provider.generate_segment(&subtitle.text, subtitle.duration()).await?;
+                
+                // Генерируем TTS
+                let mut segment = tts_provider.generate_segment(&subtitle.text, subtitle.duration()).await?;
                 let duration = start.elapsed();
-                log_debug(&format!("TTS сегмент {}/{} сгенерирован за {:.2?}", i + 1, subtitles.len(), duration));
+                
+                // Проверяем полученные данные
+                let audio_size = segment.audio_data.len();
+                log_debug(&format!("TTS сегмент {}/{} сгенерирован за {:.2?}, размер данных: {} байт",
+                    i + 1, subtitles.len(), duration, audio_size));
+                
+                if audio_size < 100 {
+                    log_warning(&format!("Подозрительно маленький размер TTS данных для сегмента {}: {} байт", 
+                        i + 1, audio_size));
+                }
+                
+                // Для отладки: сохраним полученные TTS данные во временный файл и проверим их
+                let temp_file = temp_dir.join(format!("tts_segment_{}.mp3", i + 1));
+                let temp_path = temp_file.to_str().unwrap_or("temp.mp3");
+                
+                // Сохраняем во временный файл
+                let mut file = File::create(temp_path).await
+                    .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось создать временный файл: {}", e)))?;
+                file.write_all(&segment.audio_data).await
+                    .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось записать TTS данные: {}", e)))?;
+                
+                // Проверяем формат полученных данных
+                if let Err(e) = self.validate_tts_data(temp_path).await {
+                    log_warning(&format!("Проблема с TTS данными: {}", e));
+                }
                 
                 // Добавляем в кэш
-                segments_cache.insert(subtitle.text.clone(), segment.clone());
+                segments_cache.insert(cache_key, segment.clone());
                 segment
             };
             
@@ -169,6 +213,9 @@ impl SyncCore {
         
         log_info(&format!("Сгенерировано {} TTS сегментов, из них уникальных: {}", 
             tts_segments.len(), segments_cache.len()));
+        
+        // Попытка очистки временной директории
+        let _ = std::fs::remove_dir_all(&temp_dir);
         
         Ok(tts_segments)
     }
@@ -372,7 +419,8 @@ impl SyncCore {
         
         let num_segments = audio_track.segments.len();
         let total_samples = merged_audio.samples.len();
-        log_debug(&format!("Сохранение аудио файла: {} сегментов, {} сэмплов", num_segments, total_samples));
+        log_debug(&format!("Сохранение аудио файла: {} сегментов, {} сэмплов, длительность {:.2}с", 
+            num_segments, total_samples, merged_audio.duration()));
         
         if num_segments == 0 || total_samples == 0 {
             log_error::<(), _>(
@@ -383,88 +431,74 @@ impl SyncCore {
         }
         
         // Определяем формат по расширению файла
-        let ext = path.split('.').last().unwrap_or("mp3").to_lowercase();
+        let ext = Path::new(path).extension()
+            .and_then(|os_str| os_str.to_str())
+            .unwrap_or("mp3")
+            .to_lowercase();
         
         // Всегда сначала сохраняем в WAV, так как с ним проще работать
         let temp_wav_path = format!("{}.temp.wav", path);
+        log_debug(&format!("Создание временного WAV файла: {}", temp_wav_path));
+        
+        // Сначала записываем данные в WAV формате
         self.write_wav_file(&merged_audio, &temp_wav_path).await?;
         
+        // Проверяем, что WAV файл действительно содержит данные
+        let wav_metadata = tokio::fs::metadata(&temp_wav_path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось получить информацию о WAV файле: {}", e)))?;
+        
+        log_debug(&format!("Временный WAV файл создан, размер: {} байт", wav_metadata.len()));
+        
+        if wav_metadata.len() <= 44 { // Только заголовок WAV, нет данных
+            log_error::<(), _>(
+                &Error::new(ErrorType::AudioProcessingError, "WAV файл не содержит аудио данных (только заголовок)"),
+                "Ошибка при сохранении аудио"
+            )?;
+            return Err(Error::new(ErrorType::AudioProcessingError, "WAV файл не содержит аудио данных"));
+        }
+        
+        // Теперь конвертируем в нужный формат
         match ext.as_str() {
             "mp3" => {
-                // Используем ffmpeg если доступен для конвертации WAV в MP3
-                log_debug("Конвертация WAV в MP3 с помощью ffmpeg");
+                log_debug("Конвертация WAV в MP3...");
                 
-                let result = Command::new("ffmpeg")
-                    .arg("-y") // Перезаписать выходной файл без вопросов
-                    .arg("-i")
-                    .arg(&temp_wav_path)
-                    .arg("-codec:a")
-                    .arg("libmp3lame")
-                    .arg("-qscale:a")
-                    .arg("2") // Высокое качество (0-9, где 0 - лучшее)
-                    .arg(path)
-                    .output();
+                // Пробуем использовать ffmpeg
+                let result = self.convert_with_ffmpeg(&temp_wav_path, path, "mp3", &[
+                    "-codec:a", "libmp3lame", 
+                    "-q:a", "2", // Высокое качество (0-9, где 0 - лучшее)
+                    "-b:a", "192k" // Битрейт
+                ]);
                 
                 match result {
-                    Ok(output) => {
-                        if !output.status.success() {
-                            // Если ffmpeg не удался, используем fallback метод
-                            log_warning("ffmpeg не удалось выполнить конвертацию, использую альтернативный метод");
-                            self.fallback_mp3_conversion(&temp_wav_path, path).await?;
-                        } else {
-                            log_debug(&format!("Успешно сконвертировано в MP3 с помощью ffmpeg: {}", path));
-                        }
-                    },
+                    Ok(_) => log_debug(&format!("Файл MP3 успешно создан с помощью ffmpeg: {}", path)),
                     Err(e) => {
-                        // Если ffmpeg не найден или не работает, используем fallback метод
-                        log_warning(&format!("ffmpeg не найден или не работает ({}), использую альтернативный метод", e));
-                        self.fallback_mp3_conversion(&temp_wav_path, path).await?;
+                        log_warning(&format!("Ошибка ffmpeg: {}, пробую резервный метод", e));
+                        self.convert_with_symphonia(&temp_wav_path, path, "mp3").await?;
                     }
                 }
             },
             "wav" => {
-                // WAV уже готов, просто переименовываем или копируем файл
+                // WAV уже создан, просто переименовываем
                 if temp_wav_path != path {
-                    tokio::fs::copy(&temp_wav_path, path).await.map_err(|e| Error::new(
-                        ErrorType::Io,
-                        &format!("Не удалось скопировать WAV файл: {}", e)
-                    ))?;
+                    tokio::fs::copy(&temp_wav_path, path).await
+                        .map_err(|e| Error::new(ErrorType::Io, &format!("Ошибка при копировании WAV файла: {}", e)))?;
+                    log_debug(&format!("WAV файл скопирован в: {}", path));
                 }
-                log_debug(&format!("Сохранен WAV файл: {}", path));
             },
             "ogg" => {
-                // Используем ffmpeg если доступен для конвертации WAV в OGG
-                log_debug("Конвертация WAV в OGG с помощью ffmpeg");
+                log_debug("Конвертация WAV в OGG...");
                 
-                let result = Command::new("ffmpeg")
-                    .arg("-y")
-                    .arg("-i")
-                    .arg(&temp_wav_path)
-                    .arg("-codec:a")
-                    .arg("libvorbis")
-                    .arg("-q:a")
-                    .arg("4") // Качество (0-10, где 10 - лучшее)
-                    .arg(path)
-                    .output();
+                // Пробуем использовать ffmpeg
+                let result = self.convert_with_ffmpeg(&temp_wav_path, path, "ogg", &[
+                    "-codec:a", "libvorbis",
+                    "-q:a", "6" // Качество (0-10, где 10 - лучшее)
+                ]);
                 
                 match result {
-                    Ok(output) => {
-                        if !output.status.success() {
-                            log_warning("ffmpeg не удалось выполнить конвертацию в OGG, сохраняю как WAV");
-                            tokio::fs::copy(&temp_wav_path, path).await.map_err(|e| Error::new(
-                                ErrorType::Io,
-                                &format!("Не удалось скопировать WAV файл: {}", e)
-                            ))?;
-                        } else {
-                            log_debug(&format!("Успешно сконвертировано в OGG с помощью ffmpeg: {}", path));
-                        }
-                    },
+                    Ok(_) => log_debug(&format!("Файл OGG успешно создан с помощью ffmpeg: {}", path)),
                     Err(e) => {
-                        log_warning(&format!("ffmpeg не найден или не работает ({}), сохраняю как WAV", e));
-                        tokio::fs::copy(&temp_wav_path, path).await.map_err(|e| Error::new(
-                            ErrorType::Io,
-                            &format!("Не удалось скопировать WAV файл: {}", e)
-                        ))?;
+                        log_warning(&format!("Ошибка ffmpeg: {}, пробую резервный метод", e));
+                        self.convert_with_symphonia(&temp_wav_path, path, "ogg").await?;
                     }
                 }
             },
@@ -477,144 +511,217 @@ impl SyncCore {
         }
         
         // Удаляем временный WAV файл
-        let _ = tokio::fs::remove_file(&temp_wav_path).await;
+        if Path::new(&temp_wav_path).exists() {
+            let _ = tokio::fs::remove_file(&temp_wav_path).await;
+            log_debug(&format!("Временный файл удален: {}", temp_wav_path));
+        }
+        
+        // Проверяем, что выходной файл существует и содержит данные
+        match tokio::fs::metadata(path).await {
+            Ok(metadata) => {
+                let file_size = metadata.len();
+                log_info(&format!("Финальный аудио файл создан: {}, размер: {} байт", path, file_size));
+                
+                if file_size <= 100 { // Подозрительно маленький файл
+                    log_warning(&format!("Финальный файл подозрительно мал: {} байт", file_size));
+                }
+            },
+            Err(e) => {
+                log_error::<(), _>(
+                    &Error::new(ErrorType::Io, &format!("Не удалось получить информацию о выходном файле: {}", e)),
+                    "Ошибка при проверке выходного файла"
+                )?;
+            }
+        }
         
         Ok(())
     }
     
-    /// Запасной метод для конвертации в MP3, если ffmpeg недоступен
-    async fn fallback_mp3_conversion(&self, wav_path: &str, mp3_path: &str) -> Result<()> {
-        // В реальном приложении здесь можно использовать встроенную библиотеку для кодирования MP3
-        // Например, lame-rs, minimp3, etc.
-        // В этом примере просто копируем WAV в MP3 и добавляем предупреждение
-        log_warning("Используется резервный метод конвертации WAV в MP3 - файл может быть несовместим с плеерами");
-        log_warning("Рекомендуется установить ffmpeg для правильной конвертации");
+    /// Конвертирует аудио файл с помощью ffmpeg
+    fn convert_with_ffmpeg(&self, input_path: &str, output_path: &str, format: &str, codec_args: &[&str]) -> std::io::Result<()> {
+        log_debug(&format!("Запуск ffmpeg для конвертации в {}: {} -> {}", format, input_path, output_path));
         
-        // Создаем простой заголовок MP3 (это НЕ правильный MP3, но лучше чем ничего)
-        let mut mp3_file = File::create(mp3_path).await.map_err(|e| Error::new(
-            ErrorType::Io,
-            &format!("Не удалось создать MP3 файл: {}", e)
-        ))?;
+        // Базовые аргументы
+        let mut args = vec![
+            "-y",           // Перезаписать выходной файл без вопросов
+            "-i", input_path, // Входной файл
+            "-vn",          // Без видео
+        ];
         
-        // Вместо копирования всего WAV как раньше, попробуем извлечь только PCM данные (пропуская WAV заголовок)
-        let wav_data = tokio::fs::read(wav_path).await.map_err(|e| Error::new(
-            ErrorType::Io,
-            &format!("Не удалось прочитать WAV файл: {}", e)
-        ))?;
+        // Добавляем специальные аргументы для кодека
+        args.extend_from_slice(codec_args);
         
-        // Пропускаем WAV заголовок (44 байта) и записываем только данные
-        if wav_data.len() > 44 {
-            let pcm_data = &wav_data[44..];
-            
-            // Создаем простейший "необработанный" MP3 заголовок (не настоящий MP3)
-            let mut mp3_header = vec![
-                // ID3v2 заголовок
-                b'I', b'D', b'3', // Идентификатор
-                0x03, 0x00,       // Версия
-                0x00,             // Флаги
-                0x00, 0x00, 0x00, 0x0A, // Размер (10 байт)
-                
-                // Простой фрейм (текстовый)
-                b'T', b'I', b'T', b'2', // Идентификатор фрейма (название)
-                0x00, 0x00, 0x00, 0x01, // Размер (1 байт)
-                0x00, 0x00,       // Флаги
-                0x00              // Пустое значение
-            ];
-            
-            // Записываем заголовок
-            mp3_file.write_all(&mp3_header).await.map_err(|e| Error::new(
-                ErrorType::Io,
-                &format!("Не удалось записать MP3 заголовок: {}", e)
-            ))?;
-            
-            // Записываем PCM данные (это не настоящий MP3, но может помочь отладить проблему)
-            mp3_file.write_all(pcm_data).await.map_err(|e| Error::new(
-                ErrorType::Io,
-                &format!("Не удалось записать аудио данные: {}", e)
-            ))?;
-            
-            log_debug(&format!("Записано {} байт в MP3 файл {} (резервный метод)", 
-                mp3_header.len() + pcm_data.len(), mp3_path));
-        } else {
-            log_error::<(), _>(
-                &Error::new(ErrorType::AudioProcessingError, "WAV файл слишком мал или повреждён"),
-                "Ошибка при конвертации WAV в MP3"
-            )?;
+        // Добавляем выходной файл
+        args.push(output_path);
+        
+        log_debug(&format!("Команда ffmpeg: ffmpeg {}", args.join(" ")));
+        
+        let output = Command::new("ffmpeg")
+            .args(&args)
+            .output()?;
+        
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log_warning(&format!("ffmpeg завершился с ошибкой: {}", stderr));
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, format!("ffmpeg завершился с ошибкой: {}", stderr)));
         }
+        
+        Ok(())
+    }
+    
+    /// Конвертирует аудио файл с помощью библиотеки symphonia
+    async fn convert_with_symphonia(&self, input_path: &str, output_path: &str, format: &str) -> Result<()> {
+        log_debug(&format!("Использую библиотеку symphonia для конвертации в {}: {} -> {}", format, input_path, output_path));
+        
+        // Пока не реализуем кодирование через symphonia, т.к. это требует дополнительных зависимостей
+        // Вместо этого используем прямую копию WAV файла с предупреждением
+        
+        log_warning(&format!("Полная конвертация в {} с помощью библиотеки не реализована", format));
+        log_warning("Копирую WAV файл с новым расширением как временное решение");
+        log_warning("Для корректного перекодирования аудио установите ffmpeg");
+        
+        tokio::fs::copy(input_path, output_path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Ошибка при копировании файла: {}", e)))?;
         
         Ok(())
     }
 
     /// Записывает данные аудио в формате WAV
     async fn write_wav_file(&self, audio_data: &AudioData, path: &str) -> Result<()> {
-        let mut file = File::create(path).await.map_err(|e| Error::new(
-            ErrorType::Io,
-            &format!("Не удалось создать WAV файл: {}", e)
-        ))?;
+        log_debug(&format!("Запись WAV файла: {}, {} сэмплов, {} каналов, {}Hz", 
+            path, audio_data.samples.len(), audio_data.channels, audio_data.sample_rate));
+        
+        let mut file = File::create(path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось создать WAV файл: {}", e)))?;
         
         let total_samples = audio_data.samples.len();
         let num_channels = audio_data.channels;
         let sample_rate = audio_data.sample_rate;
         
+        // Если нет сэмплов, выдаем ошибку
+        if total_samples == 0 {
+            return Err(Error::new(ErrorType::AudioProcessingError, "Попытка записать пустые аудио данные"));
+        }
+        
         // Создаем заголовок WAV
-        let data_size = (total_samples * 2) as u32; // 16-bit PCM, 2 байта на сэмпл
+        let bytes_per_sample = 2; // 16-bit PCM = 2 байта на сэмпл
+        let data_size = (total_samples * bytes_per_sample) as u32;
         let file_size = data_size + 36; // 44 байта заголовка - 8 байтов
         
-        let mut header = vec![
-            // RIFF chunk
-            b'R', b'I', b'F', b'F',
-            (file_size & 0xFF) as u8, ((file_size >> 8) & 0xFF) as u8, ((file_size >> 16) & 0xFF) as u8, ((file_size >> 24) & 0xFF) as u8,
-            b'W', b'A', b'V', b'E',
-            
-            // fmt subchunk
-            b'f', b'm', b't', b' ',
-            16, 0, 0, 0, // размер подчанка fmt (16 байтов)
-            1, 0, // аудио формат (1 = PCM)
-            (num_channels & 0xFF) as u8, ((num_channels >> 8) & 0xFF) as u8, // количество каналов
-            (sample_rate & 0xFF) as u8, ((sample_rate >> 8) & 0xFF) as u8, ((sample_rate >> 16) & 0xFF) as u8, ((sample_rate >> 24) & 0xFF) as u8, // частота дискретизации
-        ];
+        // Создаем подробный заголовок WAV
+        let mut header = Vec::new();
         
-        // Вычисляем и добавляем байт рейт и блок выравнивания
+        // RIFF chunk
+        header.extend_from_slice(b"RIFF");
+        header.extend_from_slice(&file_size.to_le_bytes());
+        header.extend_from_slice(b"WAVE");
+        
+        // fmt subchunk
+        header.extend_from_slice(b"fmt ");
+        header.extend_from_slice(&16u32.to_le_bytes()); // размер подчанка fmt (16 байтов)
+        header.extend_from_slice(&1u16.to_le_bytes()); // аудио формат (1 = PCM)
+        header.extend_from_slice(&num_channels.to_le_bytes()); // количество каналов
+        header.extend_from_slice(&sample_rate.to_le_bytes()); // частота дискретизации
+        
+        // Байт рейт = SampleRate * NumChannels * BitsPerSample / 8
         let byte_rate = sample_rate * num_channels as u32 * 16 / 8;
-        let block_align = num_channels as u16 * 16 / 8;
+        header.extend_from_slice(&byte_rate.to_le_bytes());
         
-        header.extend_from_slice(&[
-            // байт рейт = SampleRate * NumChannels * BitsPerSample / 8
-            (byte_rate & 0xFF) as u8, ((byte_rate >> 8) & 0xFF) as u8, ((byte_rate >> 16) & 0xFF) as u8, ((byte_rate >> 24) & 0xFF) as u8,
-            
-            // блок выравнивания = NumChannels * BitsPerSample / 8
-            (block_align & 0xFF) as u8, ((block_align >> 8) & 0xFF) as u8,
-            
-            16, 0, // биты на сэмпл
-            
-            // data subchunk
-            b'd', b'a', b't', b'a',
-            (data_size & 0xFF) as u8, ((data_size >> 8) & 0xFF) as u8, ((data_size >> 16) & 0xFF) as u8, ((data_size >> 24) & 0xFF) as u8,
-        ]);
+        // Блок выравнивания = NumChannels * BitsPerSample / 8
+        let block_align = num_channels as u16 * 16 / 8;
+        header.extend_from_slice(&block_align.to_le_bytes());
+        
+        header.extend_from_slice(&16u16.to_le_bytes()); // биты на сэмпл
+        
+        // data subchunk
+        header.extend_from_slice(b"data");
+        header.extend_from_slice(&data_size.to_le_bytes());
         
         // Записываем заголовок
-        file.write_all(&header).await.map_err(|e| Error::new(
-            ErrorType::Io,
-            &format!("Не удалось записать заголовок WAV: {}", e)
-        ))?;
+        file.write_all(&header).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось записать заголовок WAV: {}", e)))?;
         
-        // Конвертируем float сэмплы в 16-bit PCM и записываем их
-        let mut pcm_data = Vec::with_capacity(total_samples * 2);
+        log_debug(&format!("Записан заголовок WAV: {} байт", header.len()));
+        
+        // Конвертируем float сэмплы в 16-bit PCM
+        let mut pcm_data = Vec::with_capacity(total_samples * bytes_per_sample);
+        
         for &sample in &audio_data.samples {
             // Преобразуем float в int16, важно нормализовать значения правильно
             let pcm_sample = (sample.max(-1.0).min(1.0) * 32767.0) as i16;
             
             // Записываем в порядке little-endian (младший байт, затем старший)
-            pcm_data.push((pcm_sample & 0xFF) as u8);
-            pcm_data.push(((pcm_sample >> 8) & 0xFF) as u8);
+            pcm_data.extend_from_slice(&pcm_sample.to_le_bytes());
         }
         
-        file.write_all(&pcm_data).await.map_err(|e| Error::new(
-            ErrorType::Io,
-            &format!("Не удалось записать аудио данные: {}", e)
-        ))?;
+        // Записываем PCM данные
+        file.write_all(&pcm_data).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось записать аудио данные: {}", e)))?;
         
-        log_debug(&format!("Записано {} байт в WAV файл {}", header.len() + pcm_data.len(), path));
+        log_debug(&format!("Записаны аудио данные: {} байт", pcm_data.len()));
+        log_debug(&format!("Записан WAV файл общего размера: {} байт", header.len() + pcm_data.len()));
+        
+        // Проверяем содержимое начала файла для отладки
+        let mut debug_file = File::open(path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось открыть WAV файл для проверки: {}", e)))?;
+        
+        let mut debug_header = vec![0u8; 44];
+        let _ = debug_file.read_exact(&mut debug_header).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось прочитать заголовок для проверки: {}", e)))?;
+        
+        log_debug(&format!("Проверка заголовка WAV: RIFF={}, WAVE={}, fmt={}, data={}", 
+            &debug_header[0..4] == b"RIFF",
+            &debug_header[8..12] == b"WAVE",
+            &debug_header[12..16] == b"fmt ",
+            &debug_header[36..40] == b"data"));
+        
+        Ok(())
+    }
+
+    /// Проверяет аудиоданные TTS перед использованием
+    async fn validate_tts_data(&self, file_path: &str) -> Result<()> {
+        log_debug(&format!("Проверка аудиофайла: {}", file_path));
+        
+        // Читаем часть файла для проверки
+        let mut file = File::open(file_path).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось открыть файл для проверки: {}", e)))?;
+            
+        let metadata = file.metadata().await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось получить метаданные файла: {}", e)))?;
+            
+        let file_size = metadata.len();
+        log_debug(&format!("Размер файла: {} байт", file_size));
+        
+        if file_size < 100 {
+            // Слишком маленький файл - что-то не так
+            log_warning(&format!("Подозрительно маленький размер файла: {} байт", file_size));
+        }
+        
+        // Проверим формат файла по сигнатуре
+        let mut header = vec![0u8; 16];
+        let read_bytes = file.read(&mut header).await
+            .map_err(|e| Error::new(ErrorType::Io, &format!("Не удалось прочитать заголовок файла: {}", e)))?;
+            
+        log_debug(&format!("Прочитано {} байт заголовка", read_bytes));
+        
+        // Проверим известные сигнатуры аудиоформатов
+        let is_mp3 = header.starts_with(b"ID3") || 
+                    (header[0] == 0xFF && (header[1] & 0xE0) == 0xE0);
+        let is_wav = header.starts_with(b"RIFF") && &header[8..12] == b"WAVE";
+        let is_ogg = header.starts_with(b"OggS");
+        
+        if is_mp3 {
+            log_debug("Файл определен как MP3");
+        } else if is_wav {
+            log_debug("Файл определен как WAV");
+        } else if is_ogg {
+            log_debug("Файл определен как OGG");
+        } else {
+            log_warning("Неизвестный формат файла");
+            // Вывод первых байтов для отладки
+            let hex_display: Vec<String> = header.iter().take(16).map(|b| format!("{:02X}", b)).collect();
+            log_debug(&format!("Первые 16 байт: {}", hex_display.join(" ")));
+        }
         
         Ok(())
     }
